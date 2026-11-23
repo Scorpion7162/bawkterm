@@ -491,6 +491,11 @@
             <button type="button" class="btn" onclick={browseEditor}>Browse…</button>
           </div>
         {/if}
+        <label class="row">
+          <span>parallel SFTP files per session</span>
+          <input class="input narrow" type="number" min="1" max="8" value={s.sftpParallelFiles}
+            onchange={(e) => { const n = num(e, 1, 8); if (n !== null) set('sftpParallelFiles', n) }} />
+        </label>
         <div class="checks">
           <Checkbox checked={s.sftpShowHidden} label="show hidden files in SFTP" onchange={(v) => set('sftpShowHidden', v)} />
         </div>

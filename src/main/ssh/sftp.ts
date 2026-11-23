@@ -4,6 +4,7 @@ import { posix } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { SFTPWrapper, Stats } from 'ssh2'
 import type { ConnectTarget, FileEntry, SaveResult, SessionEvent, TextFile, TransferDirection, TransferInfo } from '@shared/types'
+import { DEFAULT_SETTINGS } from '@shared/defaults'
 import type { Prompter, Send } from '../prompts'
 import type { Vault } from '../vault'
 import { CancelledError, closeConnection, connect, type Connection } from './connect'
@@ -17,6 +18,8 @@ const MAX_DEPTH = 64
 const BOM = Buffer.from([0xef, 0xbb, 0xbf])
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0')
 const PARALLEL = 32
+// Two MiB in flight for one large file. Smaller per-file windows cap a folder transfer at four MiB.
+const BULK_REQUESTS = 64
 const FILES_AT_ONCE = 8
 const SHOW_DELETE_AFTER = 300
 const S_IFMT = 0o170000
@@ -28,11 +31,15 @@ type Policy = 'replace' | 'rename' | 'skip'
 
 interface Batch {
   policy?: Policy
+  conflicts?: Promise<void>
+  reserved?: Set<string>
 }
 
 interface Job {
   info: TransferInfo
   cancelled: boolean
+  workers?: number
+  requestBudget?: number
   hidden?: boolean
   batch: Batch
   run: (job: Job) => Promise<void>
@@ -47,6 +54,8 @@ interface Session {
   abort: AbortController
   conn?: Connection
   sftp?: SFTPWrapper
+  bulk?: Promise<SFTPWrapper>
+  active: Set<Job>
   queue: Job[]
   running: boolean
   closed: boolean
@@ -81,9 +90,9 @@ async function parallel(count: number, job: Job, take: () => (() => Promise<void
   if (rejected) throw rejected.reason
 }
 
-function pump(size: number, work: (pos: number, len: number) => Promise<void>, job: Job): Promise<void> {
+function pump(size: number, work: (pos: number, len: number) => Promise<void>, job: Job, requests: number): Promise<void> {
   let next = 0
-  return parallel(Math.min(PARALLEL, Math.ceil(size / CHUNK)), job, () => {
+  return parallel(Math.min(requests, Math.ceil(size / CHUNK)), job, () => {
     if (next >= size) return undefined
     const pos = next
     const len = Math.min(CHUNK, size - pos)
@@ -128,6 +137,25 @@ export class SftpSessions {
     return sftp
   }
 
+  private bulkChannel(sessionId: string): Promise<SFTPWrapper> {
+    const browsing = this.get(sessionId)
+    const session = this.sessions.get(sessionId)!
+    // Keep queued bulk packets off the browsing channel and reuse the existing SSH login.
+    return session.bulk ??= call<SFTPWrapper>((cb) => session.conn!.client.sftp(cb)).then((channel) => {
+      if (session.closed) {
+        channel.end()
+        throw new CancelledError()
+      }
+      channel.once('close', () => { session.bulk = undefined })
+      return channel
+    }, () => {
+      // Some servers allow only one subsystem channel per connection.
+      session.bulk = undefined
+      if (session.closed) throw new CancelledError()
+      return browsing
+    })
+  }
+
   open(sessionId: string, target: ConnectTarget): Promise<{ home: string; title: string }> {
     return this.start(sessionId, false, (session) =>
       connect(target, {
@@ -153,7 +181,7 @@ export class SftpSessions {
     connectTo: (session: Session) => Promise<Connection>
   ): Promise<{ home: string; title: string }> {
     this.close(sessionId)
-    const session: Session = { id: sessionId, abort: new AbortController(), queue: [], running: false, closed: false, borrowed }
+    const session: Session = { id: sessionId, abort: new AbortController(), queue: [], active: new Set(), running: false, closed: false, borrowed }
     this.sessions.set(sessionId, session)
     this.status(sessionId, 'connecting')
     try {
@@ -187,6 +215,10 @@ export class SftpSessions {
     if (!dropped) this.editor.stopSession(session.id)
     this.sessions.delete(session.id)
     for (const job of session.queue) this.cancel(job.info.id)
+    for (const job of session.active) this.cancel(job.info.id)
+    void session.bulk?.then((channel) => {
+      if (channel !== session.sftp) channel.end()
+    }).catch(() => {})
     session.release?.()
     if (session.borrowed) session.sftp?.end()
     else if (session.conn) closeConnection(session.conn)
@@ -377,6 +409,21 @@ export class SftpSessions {
     }
   }
 
+  private destinationKey(job: Job, dest: string): string {
+    // Fold case conservatively for case-insensitive local and remote filesystems.
+    return (job.info.direction === 'download' ? path.resolve(dest) : posix.normalize(dest)).normalize('NFC').toLowerCase()
+  }
+
+  private async resolveInOrder(sessionId: string, job: Job, exists: Exists, paths: typeof posix): Promise<string> {
+    const previous = job.batch.conflicts
+    const result = Promise.resolve(previous).then(() => {
+      if (job.cancelled) throw new CancelledError()
+      return this.resolveConflict(sessionId, job, exists, paths)
+    })
+    job.batch.conflicts = result.then(() => {}, () => {})
+    return result
+  }
+
   private async resolveConflict(sessionId: string, job: Job, exists: Exists, paths: typeof posix): Promise<string> {
     const kind = await exists(job.info.dest)
     if (!kind) return job.info.dest
@@ -405,7 +452,10 @@ export class SftpSessions {
     const stem = job.info.name.slice(0, job.info.name.length - ext.length)
     for (let n = 1; n < 1000; n++) {
       const candidate = paths.join(dir, `${stem} (${n})${ext}`)
-      if (!(await exists(candidate))) return candidate
+      const key = this.destinationKey(job, candidate)
+      if (job.batch.reserved?.has(key) || await exists(candidate)) continue
+      job.batch.reserved?.add(key)
+      return candidate
     }
     throw new Error('No free name found')
   }
@@ -434,7 +484,7 @@ export class SftpSessions {
     const job = this.createJob(sessionId, direction, name, source, dest, batch, run)
     session.queue.push(job)
     this.emit(job, true)
-    void this.drain(session)
+    queueMicrotask(() => { void this.drain(session) })
   }
 
   private createJob(
@@ -473,8 +523,41 @@ export class SftpSessions {
     if (session.running) return
     session.running = true
     while (session.queue.length) {
-      const job = session.queue.shift()!
-      if (!job.cancelled) await this.execute(job)
+      let limit = DEFAULT_SETTINGS.sftpParallelFiles
+      try {
+        const saved = this.vault.get().settings.sftpParallelFiles
+        if (Number.isInteger(saved) && saved >= 1 && saved <= FILES_AT_ONCE) limit = saved
+      } catch {
+        // The vault can lock while the transfer queue is draining.
+      }
+      const first = session.queue.shift()!
+      const group = [first]
+      const reserved = new Set([this.destinationKey(first, first.info.dest)])
+      // Only overlap jobs from one selection with distinct destinations.
+      while (group.length < limit) {
+        const next = session.queue[0]
+        if (!next || next.batch !== first.batch) break
+        const key = this.destinationKey(next, next.info.dest)
+        if (reserved.has(key)) break
+        reserved.add(key)
+        group.push(session.queue.shift()!)
+      }
+      first.batch.reserved = reserved
+      await Promise.all(group.map(async (job) => {
+        if (job.cancelled) {
+          this.jobs.delete(job.info.id)
+          this.lastEmit.delete(job.info.id)
+          return
+        }
+        job.workers = Math.floor(limit / group.length)
+        job.requestBudget = Math.floor(BULK_REQUESTS * 2 / group.length)
+        session.active.add(job)
+        try {
+          await this.execute(job)
+        } finally {
+          session.active.delete(job)
+        }
+      }))
     }
     session.running = false
   }
@@ -514,18 +597,25 @@ export class SftpSessions {
     this.emit(job)
   }
 
-  private async planLocal(src: string, dest: string): Promise<Planned> {
+  private async planLocal(src: string, dest: string, job: Job): Promise<Planned> {
     const plan: Planned = { dirs: [], files: [] }
-    const walk = async (s: string, d: string): Promise<void> => {
-      const st = await fsp.stat(s)
-      if (!st.isDirectory()) {
-        plan.files.push({ src: s, dest: d, size: st.size })
-        return
-      }
-      plan.dirs.push(d)
-      for (const name of await fsp.readdir(s)) await walk(join(s, name), posix.join(d, name))
+    let level = [{ src, dest }]
+    // Bound local metadata I/O and keep parents ahead of children for remote creation.
+    while (level.length) {
+      const below: typeof level = []
+      await each(level, async ({ src, dest }) => {
+        const st = await fsp.stat(src)
+        if (!st.isDirectory()) {
+          plan.files.push({ src, dest, size: st.size })
+          return
+        }
+        plan.dirs.push(dest)
+        for (const name of await fsp.readdir(src)) {
+          below.push({ src: join(src, name), dest: posix.join(dest, name) })
+        }
+      }, job)
+      level = below
     }
-    await walk(src, dest)
     return plan
   }
 
@@ -576,8 +666,9 @@ export class SftpSessions {
   }
 
   private async runUpload(sessionId: string, job: Job): Promise<void> {
-    const sftp = this.get(sessionId)
-    job.info.dest = await this.resolveConflict(
+    const sftp = await this.bulkChannel(sessionId)
+    if (job.cancelled) throw new CancelledError()
+    job.info.dest = await this.resolveInOrder(
       sessionId,
       job,
       (p) => call<Stats>((cb) => sftp.stat(p, cb)).then((s) => (isDir(s.mode) ? 'dir' : 'file'), () => null),
@@ -585,34 +676,51 @@ export class SftpSessions {
     )
     job.info.scanning = true
     this.emit(job, true)
-    const plan = await this.planLocal(job.info.source, job.info.dest)
+    const plan = await this.planLocal(job.info.source, job.info.dest, job)
     job.info.total = plan.files.reduce((n, f) => n + f.size, 0)
     job.info.files = plan.files.length
     this.scanned(job)
 
+    // Create siblings concurrently after their parents exist. New directories need one round trip.
+    const depths = new Map<string, number>()
+    const levels: string[][] = []
     for (const dir of plan.dirs) {
-      const exists = await call<Stats>((cb) => sftp.stat(dir, cb)).then(
-        (s) => isDir(s.mode),
-        () => false
-      )
-      if (!exists) await call((cb) => sftp.mkdir(dir, cb))
+      const depth = (depths.get(posix.dirname(dir)) ?? -1) + 1
+      depths.set(dir, depth)
+      const dirs = levels[depth] ??= []
+      dirs.push(dir)
     }
+    for (const dirs of levels) {
+      await each(dirs, async (dir) => {
+        try {
+          await call((cb) => sftp.mkdir(dir, cb))
+        } catch (err) {
+          const existing = await call<Stats>((cb) => sftp.stat(dir, cb)).catch(() => undefined)
+          if (!existing || !isDir(existing.mode)) throw err
+        }
+      }, job)
+    }
+    const requests = Math.min(BULK_REQUESTS, Math.floor((job.requestBudget ?? BULK_REQUESTS * 2) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length))))
     await each(
       plan.files,
       async (file) => {
-        await this.uploadFile(sftp, file.src, file.dest, job)
+        await this.uploadFile(sftp, file.src, file.dest, job, requests)
         job.info.filesDone++
       },
-      job
+      job,
+      job.workers
     )
   }
 
-  private async uploadFile(sftp: SFTPWrapper, src: string, dest: string, job: Job): Promise<void> {
+  private async uploadFile(sftp: SFTPWrapper, src: string, dest: string, job: Job, requests: number): Promise<void> {
     const local = await fsp.open(src, 'r')
+    const temp = posix.join(posix.dirname(dest), `.bawkterm-${randomUUID()}.part`)
+    let staged = false
     let handle: Buffer | undefined
     try {
       const { size } = await local.stat()
-      handle = await call<Buffer>((cb) => sftp.open(dest, 'w', cb))
+      handle = await call<Buffer>((cb) => sftp.open(temp, 'wx', { mode: 0o600 }, cb))
+      staged = true
       const remote = handle
       await pump(
         size,
@@ -627,24 +735,33 @@ export class SftpSessions {
           await call((cb) => sftp.write(remote, buf, 0, len, pos, cb))
           this.progress(job, len)
         },
-        job
+        job,
+        requests
       )
-    } catch (err) {
-      if (err instanceof CancelledError && handle) {
-        await call((cb) => sftp.close(handle!, cb)).catch(() => {})
-        handle = undefined
-        await call((cb) => sftp.unlink(dest, cb)).catch(() => {})
-      }
-      throw err
+      await call((cb) => sftp.close(remote, cb))
+      handle = undefined
+      if (job.cancelled) throw new CancelledError()
+      // Publish only after the server acknowledges all writes and closes the staging file.
+      await call((cb) => {
+        try {
+          sftp.ext_openssh_rename(temp, dest, cb)
+        } catch (err) {
+          if (!(err instanceof Error) || err.message !== 'Server does not support this extended request') throw err
+          sftp.rename(temp, dest, cb)
+        }
+      })
+      staged = false
     } finally {
-      await local.close()
+      await local.close().catch(() => {})
       if (handle) await call((cb) => sftp.close(handle!, cb)).catch(() => {})
+      if (staged) await call((cb) => sftp.unlink(temp, cb)).catch(() => {})
     }
   }
 
   private async runDownload(sessionId: string, job: Job): Promise<void> {
-    const sftp = this.get(sessionId)
-    job.info.dest = await this.resolveConflict(
+    const sftp = await this.bulkChannel(sessionId)
+    if (job.cancelled) throw new CancelledError()
+    job.info.dest = await this.resolveInOrder(
       sessionId,
       job,
       (p) => fsp.stat(p).then((s) => (s.isDirectory() ? 'dir' : 'file'), () => null),
@@ -656,21 +773,28 @@ export class SftpSessions {
     this.scanned(job)
 
     for (const dir of plan.dirs) await fsp.mkdir(dir, { recursive: true })
+    const requests = Math.min(BULK_REQUESTS, Math.floor((job.requestBudget ?? BULK_REQUESTS * 2) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length))))
     await each(
       plan.files,
       async (file) => {
-        await this.downloadFile(sftp, file.src, file.dest, job)
+        await this.downloadFile(sftp, file.src, file.dest, job, requests)
         job.info.filesDone++
       },
-      job
+      job,
+      job.workers
     )
   }
 
-  private async downloadFile(sftp: SFTPWrapper, src: string, dest: string, job: Job): Promise<void> {
+  private async downloadFile(sftp: SFTPWrapper, src: string, dest: string, job: Job, requests: number): Promise<void> {
     const handle = await call<Buffer>((cb) => sftp.open(src, 'r', cb))
-    const local = await fsp.open(dest, 'w')
+    const temp = join(path.dirname(dest), `.bawkterm-${randomUUID()}.part`)
+    let staged = false
+    let local: Awaited<ReturnType<typeof fsp.open>> | undefined
     try {
       const { size } = await call<Stats>((cb) => sftp.fstat(handle, cb))
+      if (job.cancelled) throw new CancelledError()
+      const output = local = await fsp.open(temp, 'wx', 0o600)
+      staged = true
       await pump(
         size,
         async (pos, len) => {
@@ -681,20 +805,25 @@ export class SftpSessions {
             if (!n) throw new Error(`${src} changed while downloading`)
             got += n
           }
-          await local.write(buf, 0, len, pos)
+          for (let written = 0; written < len; ) {
+            const { bytesWritten } = await output.write(buf, written, len - written, pos + written)
+            if (!bytesWritten) throw new Error(`Unable to write ${dest}`)
+            written += bytesWritten
+          }
           this.progress(job, len)
         },
-        job
+        job,
+        requests
       )
-    } catch (err) {
-      if (err instanceof CancelledError) {
-        await local.close().catch(() => {})
-        await fsp.rm(dest, { force: true })
-      }
-      throw err
+      await output.close()
+      local = undefined
+      if (job.cancelled) throw new CancelledError()
+      await fsp.rename(temp, dest)
+      staged = false
     } finally {
-      await local.close().catch(() => {})
+      await local?.close().catch(() => {})
       await call((cb) => sftp.close(handle, cb)).catch(() => {})
+      if (staged) await fsp.rm(temp, { force: true }).catch(() => {})
     }
   }
 }

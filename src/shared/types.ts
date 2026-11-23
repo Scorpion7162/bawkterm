@@ -244,6 +244,7 @@ export interface Settings {
   rightClickPaste: boolean
   autoLockMinutes: number
   sftpShowHidden: boolean
+  sftpParallelFiles: number
   keepAliveSec: number
   editorCommand: string
   autoReconnect: boolean

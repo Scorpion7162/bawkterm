@@ -16,6 +16,7 @@
 
   type Side = 'local' | 'remote'
   const DRAG_TYPE = 'application/x-bawkterm-files'
+  const nameOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' })
 
   let {
     side,
@@ -77,16 +78,15 @@
 
   const isDirLike = (e: FileEntry): boolean => e.kind === 'dir' || e.linkDir
 
-  const visible = $derived(
+  const sorted = $derived(
     entries
       .filter((e) => showHidden || !e.name.startsWith('.'))
-      .filter((e) => !filter || e.name.toLowerCase().includes(filter.toLowerCase()))
       .sort((a, b) => {
         const d = Number(isDirLike(b)) - Number(isDirLike(a))
         if (d) return d
         const v =
           sortKey === 'name'
-            ? a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+            ? nameOrder.compare(a.name, b.name)
             : sortKey === 'size'
               ? a.size - b.size
               : a.mtime - b.mtime
@@ -94,7 +94,14 @@
       })
   )
 
-  const selectedEntries = $derived(visible.filter((e) => selected.includes(e.path)))
+  // Search the existing order so typing never triggers another directory sort.
+  const visible = $derived.by(() => {
+    const query = filter.toLowerCase()
+    return query ? sorted.filter((e) => e.name.toLowerCase().includes(query)) : sorted
+  })
+  const selectedPaths = $derived(new Set(selected))
+  const removingPaths = $derived(new Set(removing))
+  const selectedEntries = $derived(visible.filter((e) => selectedPaths.has(e.path)))
   const favoriteNames = $derived(favoriteLabels(marks?.favorites ?? []))
 
   export async function refresh(): Promise<void> {
@@ -107,7 +114,11 @@
       const result = await list(target)
       if (seq !== loadSeq) return
       entries = result
-      selected = selected.filter((p) => result.some((e) => e.path === p))
+      if (selected.length) {
+        // Large selections should take one pass over the refreshed listing.
+        const paths = new Set(result.map((entry) => entry.path))
+        selected = selected.filter((p) => paths.has(p))
+      }
     } catch (err) {
       if (seq !== loadSeq) return
       error = (err as Error).message
@@ -141,7 +152,7 @@
       const [a, b] = [Math.min(anchor, index), Math.max(anchor, index)]
       selected = visible.slice(a, b + 1).map((x) => x.path)
     } else if (e.ctrlKey || e.metaKey) {
-      selected = selected.includes(entry.path) ? selected.filter((p) => p !== entry.path) : [...selected, entry.path]
+      selected = selectedPaths.has(entry.path) ? selected.filter((p) => p !== entry.path) : [...selected, entry.path]
       anchor = index
     } else {
       selected = [entry.path]
@@ -180,7 +191,7 @@
   }
 
   async function remove(list: FileEntry[]): Promise<void> {
-    const targets = list.filter((e) => !removing.includes(e.path))
+    const targets = list.filter((e) => !removingPaths.has(e.path))
     if (!targets.length) return
     const what = targets.length === 1 ? `"${visibleName(targets[0].name)}"` : `${targets.length} items`
     const message =
@@ -227,8 +238,8 @@
   }
 
   function rowMenu(e: MouseEvent, entry: FileEntry, index: number): void {
-    if (!selected.includes(entry.path)) select(e, entry, index)
-    const targets = selected.includes(entry.path) ? selectedEntries : [entry]
+    if (!selectedPaths.has(entry.path)) select(e, entry, index)
+    const targets = selectedPaths.has(entry.path) ? selectedEntries : [entry]
     const items: MenuItem[] = []
     if (isDirLike(entry) && targets.length === 1) items.push({ label: 'Open', action: () => navigate(entry.path) })
     if (onterminal && isDirLike(entry) && targets.length === 1) {
@@ -302,7 +313,7 @@
   }
 
   function dragstart(e: DragEvent, entry: FileEntry): void {
-    const paths = selected.includes(entry.path) ? selectedEntries.map((x) => x.path) : [entry.path]
+    const paths = selectedPaths.has(entry.path) ? selectedEntries.map((x) => x.path) : [entry.path]
     e.dataTransfer?.setData(DRAG_TYPE, JSON.stringify({ side, paths }))
     if (e.dataTransfer) e.dataTransfer.effectAllowed = 'copy'
   }
@@ -417,10 +428,10 @@
     {/if}
     {#each visible as entry, i (entry.path)}
       <div
-        class={['row', side === 'remote' && 'remote', selected.includes(entry.path) && 'selected', removing.includes(entry.path) && 'removing']}
+        class={['row', side === 'remote' && 'remote', selectedPaths.has(entry.path) && 'selected', removingPaths.has(entry.path) && 'removing']}
         role="option"
         tabindex="-1"
-        aria-selected={selected.includes(entry.path)}
+        aria-selected={selectedPaths.has(entry.path)}
         draggable="true"
         ondragstart={(e) => dragstart(e, entry)}
         onmousedown={(e) => e.button === 0 && select(e, entry, i)}
@@ -431,7 +442,7 @@
           {#if isDirLike(entry)}<Folder size={14} class="icon dir" />{:else if entry.kind === 'link'}<FileSymlink size={14} class="icon" />{:else}<FileIcon size={14} class="icon" />{/if}
           <span class="text">{visibleName(entry.name)}</span>
         </span>
-        <span class="num muted">{removing.includes(entry.path) ? 'deleting' : isDirLike(entry) ? '' : bytes(entry.size)}</span>
+        <span class="num muted">{removingPaths.has(entry.path) ? 'deleting' : isDirLike(entry) ? '' : bytes(entry.size)}</span>
         <span class="muted">{date(entry.mtime)}</span>
         {#if side === 'remote'}<span class="muted">{mode(entry.mode)}</span>{/if}
       </div>

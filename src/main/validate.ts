@@ -224,6 +224,7 @@ export function cleanSettings(v: unknown): Partial<Settings> {
   const set = <K extends keyof Settings>(key: K, check: (x: unknown) => Settings[K]): void => {
     if (s[key] !== undefined) out[key] = check(s[key])
   }
+  set('sftpParallelFiles', (x) => int(x, 'parallel SFTP files', 1, 8))
   set('theme', (x) => oneOf(x, 'theme', THEMES))
   set('terminalFontSize', (x) => int(x, 'font size', 6, 72))
   set('terminalFontFamily', (x) => line(x, 'font family', 512))

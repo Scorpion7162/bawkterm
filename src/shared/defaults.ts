@@ -12,6 +12,7 @@ export const DEFAULT_SETTINGS: Settings = {
   rightClickPaste: true,
   autoLockMinutes: 30,
   sftpShowHidden: false,
+  sftpParallelFiles: 4,
   keepAliveSec: 30,
   editorCommand: '',
   autoReconnect: true,
