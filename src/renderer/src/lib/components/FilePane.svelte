@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte'
+  import { onDestroy, untrack, type Snippet } from 'svelte'
   import ArrowUp from '@lucide/svelte/icons/arrow-up'
   import RefreshCw from '@lucide/svelte/icons/refresh-cw'
   import FolderPlus from '@lucide/svelte/icons/folder-plus'
@@ -75,6 +75,34 @@
   let filter = $state('')
   let listEl = $state<HTMLDivElement>()
   let loadSeq = 0
+  const recent = new Map<string, { entries: FileEntry[]; expires: number }>()
+
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined
+  let prefetching = false
+  let prefetched: { target: string; expires: number; result: Promise<FileEntry[] | undefined> } | undefined
+
+  function cancelHover(): void {
+    clearTimeout(hoverTimer)
+  }
+
+  onDestroy(cancelHover)
+
+  function hoverFolder(event: PointerEvent, entry: FileEntry): void {
+    cancelHover()
+    if (event.pointerType !== 'mouse' || side !== 'remote' || !isDirLike(entry)) return
+    hoverTimer = setTimeout(() => {
+      if (disabled || loading || prefetching || removingPaths.has(entry.path)) return
+      if ((recent.get(entry.path)?.expires ?? 0) > Date.now()) return
+      if (prefetched?.target === entry.path && prefetched.expires > Date.now()) return
+
+      // Give an intended double-click a head start without queueing requests as the mouse moves.
+      prefetching = true
+      const result = Promise.resolve().then(() => list(entry.path)).catch(() => undefined).finally(() => {
+        prefetching = false
+      })
+      prefetched = { target: entry.path, expires: Date.now() + 5000, result }
+    }, 150)
+  }
 
   const isDirLike = (e: FileEntry): boolean => e.kind === 'dir' || e.linkDir
 
@@ -105,15 +133,30 @@
   const favoriteNames = $derived(favoriteLabels(marks?.favorites ?? []))
 
   export async function refresh(): Promise<void> {
-    if (disabled || path === undefined) return
+    cancelHover()
+    prefetched = undefined
+    recent.clear()
+    await loadFolder(path)
+  }
+
+  async function loadFolder(target: string): Promise<void> {
     const seq = ++loadSeq
-    const target = path
+    if (disabled || target === undefined) return
     loading = true
     error = ''
     try {
-      const result = await list(target)
+      const matching = prefetched?.target === target && prefetched.expires > Date.now() ? prefetched : undefined
+      prefetched = undefined
+      const ahead = matching ? await matching.result : undefined
+      if (seq !== loadSeq) return
+      const result = ahead ?? await list(target)
       if (seq !== loadSeq) return
       entries = result
+      if (side === 'remote' && result.length <= 2000) {
+        recent.delete(target)
+        recent.set(target, { entries: result, expires: Date.now() + 15_000 })
+        if (recent.size > 12) recent.delete(recent.keys().next().value!)
+      }
       if (selected.length) {
         // Large selections should take one pass over the refreshed listing.
         const paths = new Set(result.map((entry) => entry.path))
@@ -121,6 +164,7 @@
       }
     } catch (err) {
       if (seq !== loadSeq) return
+      recent.delete(target)
       error = (err as Error).message
       entries = []
     } finally {
@@ -129,12 +173,26 @@
   }
 
   $effect(() => {
-    pathInput = path
-    void disabled
+    const target = path
+    const disconnected = disabled
+    cancelHover()
+    pathInput = target
     filter = ''
     selected = []
     anchor = -1
-    void refresh()
+    if (disconnected) {
+      prefetched = undefined
+      recent.clear()
+      loadSeq++
+      entries = []
+      error = ''
+      loading = false
+      return
+    }
+    // Show a recent listing immediately while fetching the current contents.
+    const cached = recent.get(target)
+    entries = cached && cached.expires > Date.now() ? cached.entries : []
+    untrack(() => { void loadFolder(target) })
   })
 
   function navigate(to: string | null): void {
@@ -423,6 +481,8 @@
   >
     {#if error}
       <p class="state error selectable">{error}</p>
+    {:else if loading && !entries.length}
+      <p class="state muted">opening folder…</p>
     {:else if !loading && !visible.length && !disabled}
       <p class="state muted">empty folder</p>
     {/if}
@@ -435,6 +495,8 @@
         draggable="true"
         ondragstart={(e) => dragstart(e, entry)}
         onmousedown={(e) => e.button === 0 && select(e, entry, i)}
+        onpointerenter={(event) => hoverFolder(event, entry)}
+        onpointerleave={cancelHover}
         ondblclick={() => activate(entry)}
         oncontextmenu={(e) => rowMenu(e, entry, i)}
       >

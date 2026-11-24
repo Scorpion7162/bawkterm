@@ -2,7 +2,7 @@ import { promises as fsp } from 'node:fs'
 import path, { basename, join } from 'node:path'
 import { posix } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { SFTPWrapper, Stats } from 'ssh2'
+import { utils, type SFTPWrapper, type Stats } from 'ssh2'
 import type { ConnectTarget, FileEntry, SaveResult, SessionEvent, TextFile, TransferDirection, TransferInfo } from '@shared/types'
 import { DEFAULT_SETTINGS } from '@shared/defaults'
 import type { Prompter, Send } from '../prompts'
@@ -18,8 +18,7 @@ const MAX_DEPTH = 64
 const BOM = Buffer.from([0xef, 0xbb, 0xbf])
 const SQLITE_MAGIC = Buffer.from('SQLite format 3\0')
 const PARALLEL = 32
-// Two MiB in flight for one large file. Smaller per-file windows cap a folder transfer at four MiB.
-const BULK_REQUESTS = 64
+const BULK_REQUESTS = 128
 const FILES_AT_ONCE = 8
 const SHOW_DELETE_AFTER = 300
 const S_IFMT = 0o170000
@@ -241,7 +240,21 @@ export class SftpSessions {
 
   async list(sessionId: string, dir: string): Promise<FileEntry[]> {
     const sftp = this.get(sessionId)
-    const items = await call<{ filename: string; attrs: Stats }[]>((cb) => sftp.readdir(dir, cb))
+    const handle = await call<Buffer>((cb) => sftp.opendir(dir, cb))
+    const items: { filename: string; attrs: Stats }[] = []
+    try {
+      for (;;) {
+        const page = await call<typeof items>((cb) => sftp.readdir(handle, cb)).catch((err) => {
+          if (err.code !== utils.sftp.STATUS_CODE.EOF) throw err
+          return undefined
+        })
+        if (!page) break
+        for (const item of page) items.push(item)
+      }
+    } finally {
+      // The listing is ready at EOF. Send CLOSE without waiting another round trip to display it.
+      void call((cb) => sftp.close(handle, cb)).catch(() => {})
+    }
     return Promise.all(
       items
         .filter((i) => i.filename !== '.' && i.filename !== '..')
@@ -550,7 +563,7 @@ export class SftpSessions {
           return
         }
         job.workers = Math.floor(limit / group.length)
-        job.requestBudget = Math.floor(BULK_REQUESTS * 2 / group.length)
+        job.requestBudget = Math.floor(BULK_REQUESTS / group.length)
         session.active.add(job)
         try {
           await this.execute(job)
@@ -700,7 +713,7 @@ export class SftpSessions {
         }
       }, job)
     }
-    const requests = Math.min(BULK_REQUESTS, Math.floor((job.requestBudget ?? BULK_REQUESTS * 2) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length))))
+    const requests = Math.floor((job.requestBudget ?? BULK_REQUESTS) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length)))
     await each(
       plan.files,
       async (file) => {
@@ -773,7 +786,7 @@ export class SftpSessions {
     this.scanned(job)
 
     for (const dir of plan.dirs) await fsp.mkdir(dir, { recursive: true })
-    const requests = Math.min(BULK_REQUESTS, Math.floor((job.requestBudget ?? BULK_REQUESTS * 2) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length))))
+    const requests = Math.floor((job.requestBudget ?? BULK_REQUESTS) / Math.max(1, Math.min(job.workers ?? FILES_AT_ONCE, plan.files.length)))
     await each(
       plan.files,
       async (file) => {
